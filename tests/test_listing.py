@@ -49,6 +49,8 @@ class ListingTests(unittest.TestCase):
     def test_exclude_per_room_and_aggregate_multiple_rooms_same_port(self):
         rooms, _ = parse_listing("CORRODINGGAMES\n" + "\n".join([row("official", dedicated=True), row("third"), row("third2", port=5124)]), {})
         selected = [r for r in rooms if exclusion_reason(r, Config()) is None]
+        for room in selected:
+            room.lookup_status = "resolved"
         self.assertEqual(2, len(selected))
         self.assertEqual({"5123", "5124"}, set(aggregate(selected)["203.0.113.4"]))
         selected.append(selected[0])
@@ -100,3 +102,42 @@ class ListingTests(unittest.TestCase):
         self.assertIsNone(rooms[0].players)
         self.assertIsNone(rooms[0].max_players)
         self.assertEqual("dedicated", exclusion_reason(rooms[0], Config()))
+
+    def test_get_rejects_invalid_target(self):
+        def handler(connection):
+            header = read_header(connection)
+            length = int(next(line.split(b":", 1)[1] for line in header.split(b"\r\n")
+                              if line.lower().startswith(b"content-length:")))
+            recv_exact(connection, length)
+            checksum = hashlib.sha256(b"game_").hexdigest()[:14]
+            body = ("CORRODINGGAMES\nOK\n" + checksum + "\n\n" + row("bad", host, port)).encode()
+            connection.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+
+        for host, port in (("", 5123), ("203.0.113.4", 70000), ("203.0.113.4", 0)):
+            with self.subTest(host=host, port=port), OneServer(handler) as server:
+                config = Config(masters=[f"http://127.0.0.1:{server.port}/interface"])
+                with self.assertRaises(OSError):
+                    lookup_room(config, "bad", 0, None)
+
+    def test_aggregate_ignores_unresolved_address_and_stale_dns(self):
+        room = parse_listing("CORRODINGGAMES\n" + row(), {})[0][0]
+        room.resolved_ips = ["203.0.113.4"]
+        for status in ("pending", "failed"):
+            with self.subTest(status=status):
+                room.lookup_status = status
+                self.assertEqual({}, aggregate([room]))
+                self.assertIsNone(exclusion_reason(room, Config(exclude_ips=[room.host])))
+
+    def test_get_preserves_master_failure_details(self):
+        def handler(connection):
+            header = read_header(connection)
+            length = int(next(line.split(b":", 1)[1] for line in header.split(b"\r\n")
+                              if line.lower().startswith(b"content-length:")))
+            recv_exact(connection, length)
+            body = b"CORRODINGGAMES[FAILED]\nERROR_MISSING"
+            connection.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+
+        with OneServer(handler) as server:
+            config = Config(masters=[f"http://127.0.0.1:{server.port}/interface"])
+            with self.assertRaisesRegex(OSError, "ERROR_MISSING"):
+                lookup_room(config, "missing", 0, None)

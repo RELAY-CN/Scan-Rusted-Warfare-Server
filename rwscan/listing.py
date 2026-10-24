@@ -103,6 +103,21 @@ class Room:
     observations: list[dict] = field(default_factory=list)
     raw_columns: list[str] = field(default_factory=list)
     resolved_ips: list[str] = field(default_factory=list)
+    listed_host: str = ""
+    listed_port: int | None = None
+    lookup_status: str = "pending"
+    lookup_error: str | None = None
+
+    def __post_init__(self):
+        # 旧结果文件没有解析状态，按待查询处理；列表入口仅用于追溯。
+        if not self.listed_host:
+            self.listed_host = self.host
+        if self.listed_port is None:
+            self.listed_port = self.port
+
+    @property
+    def address_ready(self):
+        return not self.host.startswith("url:") and (self.dedicated or self.lookup_status == "resolved")
 
     @property
     def name(self):
@@ -110,7 +125,7 @@ class Room:
 
     @property
     def key(self):
-        return (self.room_id, self.host, self.port)
+        return (self.room_id, self.listed_host, self.listed_port)
 
     def to_dict(self):
         return {**asdict(self), "room_name": self.name, "is_link": self.host.startswith("url:")}
@@ -231,21 +246,21 @@ def exclusion_reason(room: Room, config):
         return "dedicated"
     if room.room_id in config.exclude_room_ids:
         return "room_id"
-    if room.host in config.exclude_ips or set(room.resolved_ips) & set(config.exclude_ips):
+    if room.address_ready and (room.host in config.exclude_ips or set(room.resolved_ips) & set(config.exclude_ips)):
         return "ip"
     return None
 
 
 def resolve_hosts(rooms: list[Room]):
     errors = []
-    for host in sorted({r.host for r in rooms if not r.host.startswith("url:")}):
+    for host in sorted({r.host for r in rooms if r.address_ready}):
         try:
             try:
                 ips = [str(ipaddress.ip_address(host))]
             except ValueError:
                 ips = sorted({result[4][0] for result in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)})
             for room in rooms:
-                if room.host == host:
+                if room.address_ready and room.host == host:
                     room.resolved_ips = ips
         except OSError as error:
             errors.append({"host": host, "error": str(error)})
@@ -255,6 +270,9 @@ def resolve_hosts(rooms: list[Room]):
 def aggregate(rooms: list[Room]):
     result = {}
     for room in rooms:
+        # get 未成功时，公共入口不能作为真实服务器参与聚合。
+        if not room.address_ready:
+            continue
         for ip in room.resolved_ips or [room.host]:
             ports = result.setdefault(ip, {})
             ports.setdefault(str(room.port), []).append(room.to_dict())
@@ -299,15 +317,69 @@ def lookup_room(config, room_id: str, code: int, password: str | None, *, deadli
             raise TimeoutError("主服务器 get 超过房间总时限")
         try:
             lines = request_text(master, params, config.list_proxy, timeout, post=True).splitlines()
-            if len(lines) < 5 or not lines[0].startswith("CORRODINGGAMES") or "[FAILED]" in lines[0]:
-                raise ValueError("get 返回失败或截断响应")
+            if not lines or not lines[0].startswith("CORRODINGGAMES"):
+                raise ValueError("get 返回无效响应头")
+            if "[FAILED]" in lines[0]:
+                raise ValueError("get 返回失败：" + (lines[1] if len(lines) > 1 else "无错误详情"))
+            if len(lines) < 5:
+                raise ValueError("get 返回截断响应")
             expected = hashlib.sha256(("game_" + challenge).encode()).hexdigest()[:14]
             if expected.lower() not in lines[2].lower():
                 raise ValueError("get 返回校验值不匹配")
             columns = lines[4].split(",")
             if len(columns) <= 18:
                 raise ValueError("get 地址行列数不足")
-            return columns[3], int(columns[5])
+            host, port = columns[3].strip(), int(columns[5])
+            if not host or host.startswith("url:") or any(c.isspace() or ord(c) < 32 for c in host):
+                raise ValueError("get 返回非法服务器地址")
+            if not 1 <= port <= 65535:
+                raise ValueError("get 返回端口不在 1..65535")
+            return host, port
         except (OSError, EOFError, ValueError, http.client.HTTPException) as error:
             errors.append(f"{master}: {error}")
     raise OSError("所有主服务器 get 失败：" + "; ".join(errors))
+
+
+def room_password(room, config):
+    for key in (room.room_id, authority(room.host, room.port), authority(room.listed_host, room.listed_port)):
+        if key in config.passwords:
+            return config.passwords[key]
+    return None
+
+
+def resolve_room_address(room, config, *, deadline=None):
+    """非官方记录统一通过 get 定址，成功后 host/port 是唯一实际地址。"""
+    if room.host.startswith("url:"):
+        room.lookup_status = "link"
+        return
+    if room.dedicated:
+        room.lookup_status = "official"
+        return
+    if room.lookup_status == "resolved":
+        return
+    if room.lookup_status == "failed":
+        # 同一轮列表查询的失败不在扫描阶段重复请求，更不能回退公共入口。
+        raise OSError(room.lookup_error or "房间 get 地址解析失败")
+    room.resolved_ips = []
+    try:
+        host, port = lookup_room(config, room.room_id, room.lookup_code, room_password(room, config), deadline=deadline)
+    except (OSError, EOFError, ValueError, http.client.HTTPException) as error:
+        room.lookup_status, room.lookup_error = "failed", str(error)
+        raise
+    room.host, room.port = host, port
+    room.lookup_status, room.lookup_error = "resolved", None
+
+
+def resolve_room_addresses(rooms, config):
+    def resolve(room):
+        try:
+            resolve_room_address(room, config)
+        except (OSError, EOFError, ValueError, http.client.HTTPException):
+            # 具体失败已保存到房间，报告与输出都使用同一状态。
+            pass
+        return {"room_id": room.room_id, "listed_host": room.listed_host, "listed_port": room.listed_port,
+                "host": room.host if room.address_ready else None, "port": room.port if room.address_ready else None,
+                "status": room.lookup_status, "error": room.lookup_error}
+
+    with ThreadPoolExecutor(max_workers=config.concurrency) as pool:
+        return list(pool.map(resolve, rooms))

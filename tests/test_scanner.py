@@ -71,6 +71,7 @@ class ScannerTests(unittest.TestCase):
 
                 with OneServer(origin_handler) as origin:
                     room = parse_listing("CORRODINGGAMES\n" + row("local", "127.0.0.1", origin.port), {})[0][0]
+                    room.lookup_status = "resolved"
                     result = scan_room(room, config, store)
                     self.assertEqual("disconnected", result["status"])
                     self.assertEqual(2, result["chat_count"])
@@ -97,6 +98,7 @@ class ScannerTests(unittest.TestCase):
 
             with OneServer(handler) as server:
                 room = parse_listing("CORRODINGGAMES\n" + row("local", "127.0.0.1", server.port), {})[0][0]
+                room.lookup_status = "resolved"
                 result = scan_room(room, config, Store(directory))
                 self.assertTrue(any("循环" in e["error"] for e in result["errors"]))
 
@@ -120,6 +122,7 @@ class ScannerTests(unittest.TestCase):
 
             with OneServer(handler) as server:
                 room = parse_listing("CORRODINGGAMES\n" + row("local", "127.0.0.1", server.port), {})[0][0]
+                room.lookup_status = "resolved"
                 result = scan_room(room, Config(output_dir=directory, listen_seconds=2), Store(directory))
                 self.assertEqual("password_required", result["status"])
                 self.assertEqual([], json.loads((Path(directory) / "matched_servers.json").read_text()))

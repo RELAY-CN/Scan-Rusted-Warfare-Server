@@ -8,7 +8,7 @@ from collections import Counter
 from pathlib import Path
 
 from .config import load_config
-from .listing import Room, aggregate, exclusion_reason, fetch_rooms, now, resolve_hosts
+from .listing import Room, aggregate, exclusion_reason, fetch_rooms, now, resolve_hosts, resolve_room_addresses
 from .scanner import scan_rooms
 from .storage import write_json
 
@@ -19,6 +19,7 @@ def display(value):
 
 def output_inventory(rooms, report, config):
     root = Path(config.output_dir)
+    report["get_queries"] = resolve_room_addresses(rooms, config)
     report["dns_errors"] = resolve_hosts(rooms)
     selected, excluded = [], []
     for room in rooms:
@@ -41,7 +42,7 @@ def output_inventory(rooms, report, config):
         for ip, ports in grouped.items():
             for port, items in ports.items():
                 for room in items:
-                    writer.writerow({"ip": ip, "port": port, **room})
+                    writer.writerow({**room, "ip": ip, "port": port})
     for ip, ports in grouped.items():
         print(display(ip))
         for port, items in ports.items():
@@ -52,12 +53,15 @@ def output_inventory(rooms, report, config):
                       f"{display(room['version'])} ({room['version_code']}) | "
                       f"{players}/{maximum} | {display(room['status'])}")
     failures = [q for q in report["queries"] if q["error"]]
+    get_failures = [q for q in report["get_queries"] if q["status"] == "failed"]
     print(f"共取得 {len(rooms)} 个房间记录，纳入 {len(selected)} 个，排除 {len(excluded)} 个，聚合 {len(grouped)} 个 IP/域名。")
     if failures:
         print(f"{len(failures)} 次查询失败，详情见 fetch_report.json。", file=sys.stderr)
     if report["parse_errors"]:
         print(f"{len(report['parse_errors'])} 行解析失败，原文已保存。", file=sys.stderr)
-    return selected, bool(failures or report["parse_errors"] or report["dns_errors"])
+    if get_failures:
+        print(f"{len(get_failures)} 个房间 get 失败，记录已保留，未参与 IP 聚合，详情见 fetch_report.json。", file=sys.stderr)
+    return selected, bool(failures or get_failures or report["parse_errors"] or report["dns_errors"])
 
 
 def main(argv=None):
@@ -122,8 +126,9 @@ def main(argv=None):
         counts = Counter(r["status"] for r in results)
         print("扫描状态：" + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
         print(f"结果目录：{config.output_dir}；命中服务器见 matched_servers.json，跳转见 redirects.jsonl。")
-        successful = {"listened", "disconnected", "connection_closed"}
-        failed = any(r["status"] not in successful or not any(e.get("connected") for e in r["endpoints"]) for r in results)
+        successful = {"listened", "disconnected", "connection_closed", "excluded"}
+        failed = any(r["status"] not in successful or
+                     (r["status"] != "excluded" and not any(e.get("connected") for e in r["endpoints"])) for r in results)
         return 2 if partial or failed else 0
     except (OSError, ValueError, KeyError, TypeError) as error:
         print("错误：" + display(error), file=sys.stderr)

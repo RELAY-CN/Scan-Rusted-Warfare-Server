@@ -8,7 +8,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from .listing import lookup_room
+from .listing import exclusion_reason, lookup_room, resolve_room_address, room_password
 from .protocol import (CHAT, RECONNECT, SERVER_PREREGISTER, INITIAL_CHALLENGE_FIRST,
                        INITIAL_CHALLENGE_SECOND, ProtocolError, Reader, Writer,
                        challenge_reply, decode_chat, decode_preregister, decode_redirect, parse_address,
@@ -61,22 +61,26 @@ def scan_room(room, config, store, proxy_index=0, limiter=None):
     session_id = store.begin(room, proxy_index)
     proxy = config.proxies[proxy_index]
     client_id = str(uuid.uuid4())
-    password = config.passwords.get(room.room_id, config.passwords.get(authority(room.host, room.port)))
     deadline = time.monotonic() + config.listen_seconds
-    candidates = [(room.host, room.port, None, "origin")]
+    candidates = []
     visited = set()
     redirects = 0
-    status = "connection_failed"
+    status = "lookup_failed"
     normalized = [(word, word if config.case_sensitive else word.casefold()) for word in config.keywords]
-    origin = describe_endpoint(room.host, room.port)
-    store.endpoint(session_id, origin)
     try:
-        if room.lookup_code:
-            host, port = lookup_room(config, room.room_id, room.lookup_code, password, deadline=deadline)
-            candidates = [(host, port, None, "lookup")]
-            if (host, port) != (room.host, room.port):
-                store.redirect(session_id, {"kind": "master_get", "from": origin, "addresses": [authority(host, port)]})
-                store.endpoint(session_id, describe_endpoint(host, port, role="lookup"))
+        resolve_room_address(room, config, deadline=deadline)
+        # get 是加入前的定址，不构成 TCP 跳转；公共列表入口不进入端点图。
+        origin = describe_endpoint(room.host, room.port)
+        room.resolved_ips = origin["ips"]
+        reason = exclusion_reason(room, config)
+        if reason:
+            store.metadata(session_id, "exclusion_reason", reason)
+            status = "excluded"
+        else:
+            candidates = [(room.host, room.port, None, "origin")]
+            store.endpoint(session_id, origin)
+            status = "connection_failed"
+        password = room_password(room, config)
         while candidates and time.monotonic() < deadline:
             stream, endpoint = None, None
             for host, port, query, role in candidates:
@@ -211,8 +215,8 @@ def scan_room(room, config, store, proxy_index=0, limiter=None):
             candidates = next_candidates
     except (OSError, EOFError, ValueError) as error:
         store.error(session_id, str(error))
-        status = "lookup_failed"
     finally:
+        store.metadata(session_id, "room", room.to_dict())
         store.finish(session_id, status)
     return store.sessions[session_id]
 
