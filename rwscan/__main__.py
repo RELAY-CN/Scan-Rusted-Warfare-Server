@@ -17,6 +17,33 @@ def display(value):
     return "".join(c if c.isprintable() else " " for c in str(value))[:200]
 
 
+def status_label(status):
+    # 只翻译终端展示，持久化状态仍保留稳定的协议/扫描标识。
+    labels = {
+        "connecting": "正在连接",
+        "lookup_failed": "地址查询失败",
+        "connection_failed": "连接失败",
+        "no_server_info": "未收到服务器预注册响应",
+        "registered_unconfirmed": "已注册，等待加入确认",
+        "listening": "正在监听",
+        "listened": "监听结束",
+        "redirected": "已跳转",
+        "redirect_failed": "跳转失败",
+        "redirect_loop": "跳转循环",
+        "kicked": "被服务器踢出",
+        "disconnected": "服务器已断开连接",
+        "connection_closed": "连接已关闭",
+        "join_rejected": "加入被拒绝",
+        "password_required": "需要密码或密码错误",
+        "protocol_error": "协议错误",
+        "excluded": "已排除",
+        "battleroom": "等待玩家",
+        "ingame": "游戏进行中",
+        "locked": "房间已锁定",
+    }
+    return labels.get(status, f"未知状态（{display(status)}）")
+
+
 def output_inventory(rooms, report, config):
     root = Path(config.output_dir)
     report["get_queries"] = resolve_room_addresses(rooms, config)
@@ -51,7 +78,7 @@ def output_inventory(rooms, report, config):
                 maximum = "?" if room["max_players"] is None else room["max_players"]
                 print(f"  :{port}  {display(room['room_name'])} | {display(room['map_name'])} | "
                       f"{display(room['version'])} ({room['version_code']}) | "
-                      f"{players}/{maximum} | {display(room['status'])}")
+                      f"{players}/{maximum} | {status_label(room['status'])}")
     failures = [q for q in report["queries"] if q["error"]]
     get_failures = [q for q in report["get_queries"] if q["status"] == "failed"]
     print(f"共取得 {len(rooms)} 个房间记录，纳入 {len(selected)} 个，排除 {len(excluded)} 个，聚合 {len(grouped)} 个 IP/域名。")
@@ -120,11 +147,11 @@ def main(argv=None):
         def show_result(result):
             room = result["room"]
             print(f"{display(room['host'])}:{room['port']} {display(room['room_name'])} "
-                  f"状态={result['status']} 聊天={result['chat_count']} 命中={len(result['matches'])} 跳转={len(result['redirects'])}", flush=True)
+                  f"状态={status_label(result['status'])} 聊天={result['chat_count']} 命中={len(result['matches'])} 跳转={len(result['redirects'])}", flush=True)
 
         results = scan_rooms(rooms, config, show_result)
         counts = Counter(r["status"] for r in results)
-        print("扫描状态：" + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+        print("扫描状态：" + "，".join(f"{status_label(k)}={v}" for k, v in sorted(counts.items())))
         print(f"结果目录：{config.output_dir}；命中服务器见 matched_servers.json，跳转见 redirects.jsonl。")
         successful = {"listened", "disconnected", "connection_closed", "excluded"}
         failed = any(r["status"] not in successful or
